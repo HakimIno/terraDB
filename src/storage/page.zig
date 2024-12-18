@@ -1,6 +1,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
+const builtin = @import("builtin");
+const x86 = std.Target.x86;
 
 // Constants using comptime for better optimization
 pub const PAGE_SIZE: comptime_int = 4096;
@@ -61,7 +63,7 @@ pub const PageHeader = extern struct {
 // Use alignment for better memory access
 pub const Page = struct {
     header: PageHeader align(8),
-    data: []align(8) u8,
+    data: [PAGE_SIZE - @sizeOf(PageHeader)]u8 align(8),
     allocator: Allocator,
 
     // Use better error handling
@@ -73,82 +75,122 @@ pub const Page = struct {
         InvalidFreeSpaceOffset,
     };
 
+    // Optimized init with fixed-size array
     pub fn init(allocator: Allocator, page_type: PageType, page_id: u32) !Page {
-        // Allocate exactly PAGE_SIZE - @sizeOf(PageHeader) bytes for data
-        const data_size = PAGE_SIZE - @sizeOf(PageHeader);
-        const data = try allocator.alignedAlloc(u8, 8, data_size);
-        @memset(data, 0);
-        
-        var header = PageHeader.init(page_type, page_id);
-        header.calculateChecksum();
-
-        return .{
-            .header = header,
-            .data = data,
+        var page = Page{
+            .header = PageHeader.init(page_type, page_id),
+            .data = undefined,
             .allocator = allocator,
         };
+        @memset(&page.data, 0);
+        return page;
     }
 
+    // ไม่จำเป็นต้องมี deinit เพราะใช้ fixed-size array แล้ว
     pub fn deinit(self: *Page) void {
-        self.allocator.free(self.data);
+        _ = self;
     }
 
-    // Optimize write operation
-    pub fn write(self: *Page, offset: u16, data_in: []const u8) Error!void {
-        if (@sizeOf(PageHeader) > offset) return error.InvalidOffset;
-        if (data_in.len > self.data.len or offset + data_in.len > PAGE_SIZE) {
-            return error.PageOverflow;
-        }
-
+    // Optimized write with minimal overhead
+    pub inline fn write(self: *Page, offset: u16, data_in: []const u8) Error!void {
+        if (offset < @sizeOf(PageHeader) or offset + data_in.len > PAGE_SIZE) 
+            return error.InvalidOffset;
+        
         const write_offset = offset - @sizeOf(PageHeader);
-        if (@hasDecl(std.simd, "copy")) {
-            std.simd.copy(self.data[write_offset..][0..data_in.len], data_in);
-        } else {
+        
+        // Ultra-fast path for tiny writes (<=8 bytes)
+        if (data_in.len <= 8) {
             @memcpy(self.data[write_offset..][0..data_in.len], data_in);
+            self.header.free_space_offset = @intCast(offset + data_in.len);
+            return;
         }
+
+        // Fast path for small writes (<=32 bytes)
+        if (data_in.len <= 32) {
+            const Vec = @Vector(32, u8);
+            const src = @as(*align(1) const Vec, @ptrCast(&data_in[0]));
+            const dst = @as(*align(1) Vec, @ptrCast(&self.data[write_offset]));
+            dst.* = src.*;
+            self.header.free_space_offset = @intCast(offset + data_in.len);
+            return;
+        }
+
+        // Use prefetch for larger writes
+        if (data_in.len > 64) {
+            const ptr = &self.data[write_offset + 64];
+            asm volatile("prefetchnta (%[ptr])"
+                :
+                : [ptr] "r" (ptr)
+                : "memory"
+            );
+        }
+
+        // Aligned copy for larger writes
+        @memcpy(self.data[write_offset..][0..data_in.len], data_in);
         self.header.free_space_offset = @intCast(offset + data_in.len);
-        self.header.calculateChecksum();
     }
 
-    // Optimize read operation with better error checking
-    pub fn read(self: Page, offset: u16, len: usize) Error![]const u8 {
-        if (@sizeOf(PageHeader) > offset) return error.InvalidOffset;
-        if (len == 0) return error.InvalidLength;
-        if (len > self.data.len or offset + len > PAGE_SIZE) {
-            return error.PageOverflow;
+    // Ultra-optimized read
+    pub inline fn read(self: *const Page, offset: u16, len: usize) Error![]const u8 {
+        if (offset < @sizeOf(PageHeader) or offset + len > PAGE_SIZE) 
+            return error.InvalidOffset;
+        
+        const read_offset = offset - @sizeOf(PageHeader);
+        
+        // Use prefetch for large reads
+        if (len > 64) {
+            const ptr = &self.data[read_offset + 64];
+            asm volatile("prefetchnta (%[ptr])"
+                :
+                : [ptr] "r" (ptr)
+                : "memory"
+            );
         }
 
-        const read_offset = offset - @sizeOf(PageHeader);
         return self.data[read_offset..][0..len];
+    }
+
+    // Optimized serialization with error handling
+    pub inline fn serialize(self: *const Page) Error![PAGE_SIZE]u8 {
+        var buffer: [PAGE_SIZE]u8 align(8) = undefined;
+        
+        // Copy header
+        @memcpy(buffer[0..@sizeOf(PageHeader)], @as([*]const u8, @ptrCast(&self.header))[0..@sizeOf(PageHeader)]);
+        
+        // Copy data
+        @memcpy(buffer[@sizeOf(PageHeader)..], &self.data);
+        
+        // Calculate checksum before returning
+        var temp_header = @as(*PageHeader, @ptrCast(@alignCast(&buffer[0])));
+        temp_header.calculateChecksum();
+        
+        return buffer;
+    }
+
+    // Optimized deserialization with error handling
+    pub inline fn deserialize(allocator: Allocator, buffer: *align(8) const [PAGE_SIZE]u8) !Page {
+        const header = @as(*const PageHeader, @ptrCast(@alignCast(&buffer[0]))).*;
+        
+        // Verify checksum
+        if (!header.verifyChecksum()) {
+            return error.ChecksumMismatch;
+        }
+        
+        var page = Page{
+            .header = header,
+            .data = undefined,
+            .allocator = allocator,
+        };
+        
+        // Copy data
+        @memcpy(&page.data, buffer[@sizeOf(PageHeader)..][0..page.data.len]);
+        
+        return page;
     }
 
     // Use comptime for constant calculations
     pub inline fn getFreeSpace(self: Page) u16 {
         return @intCast(PAGE_SIZE - self.header.free_space_offset);
-    }
-
-    // Optimize serialization
-    pub fn serialize(self: Page) ![PAGE_SIZE]u8 {
-        var buffer: [PAGE_SIZE]u8 align(8) = undefined;
-        const header_bytes = std.mem.asBytes(&self.header);
-        
-        @memcpy(buffer[0..header_bytes.len], header_bytes);
-        @memcpy(buffer[@sizeOf(PageHeader)..], self.data);
-        
-        return buffer;
-    }
-
-    // Optimize deserialization with better error handling
-    pub fn deserialize(allocator: Allocator, buffer: *align(8) const [PAGE_SIZE]u8) !Page {
-        const header = @as(*const PageHeader, @ptrCast(@alignCast(&buffer[0]))).*;
-        
-        if (!header.verifyChecksum()) return error.ChecksumMismatch;
-
-        var page = try Page.init(allocator, header.page_type, header.page_id);
-        page.header = header;
-        @memcpy(page.data, buffer[@sizeOf(PageHeader)..][0..page.data.len]);
-
-        return page;
     }
 
     // Optimize defragmentation
@@ -175,14 +217,14 @@ pub const Page = struct {
         }
     }
 
-    // เพิ่มฟังก์ชันใหม่สำหร���บ zero-copy serialization
+    // เพิ่มฟังก์ชันใหม่สำหรับ zero-copy serialization
     pub fn serializeInto(self: *const Page, buffer: *[PAGE_SIZE]u8) void {
         const header_bytes = std.mem.asBytes(&self.header);
         @memcpy(buffer[0..@sizeOf(PageHeader)], header_bytes);
         @memcpy(buffer[@sizeOf(PageHeader)..], self.data);
     }
 
-    // เพิ่มฟังก์ชันใหม่สำหรับ zero-copy deserialization
+    // เพิมฟังก์ชันใหม่สำหรับ zero-copy deserialization
     pub fn deserializeFrom(allocator: Allocator, buffer: *align(8) const [PAGE_SIZE]u8) !Page {
         const header = @as(*const PageHeader, @ptrCast(@alignCast(&buffer[0]))).*;
         if (!header.verifyChecksum()) return error.ChecksumMismatch;

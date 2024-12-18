@@ -29,28 +29,28 @@ pub fn build(b: *std.Build) void {
     });
     page_benchmark.root_module.addImport("storage", storage_module);
 
-    // Add memory pool benchmark
-    const memory_pool_benchmark = b.addTest(.{
-        .name = "memory-pool-benchmark",
-        .root_source_file = .{ .cwd_relative = "tests/memory_pool_benchmark_test.zig" },
+    // Add pager benchmark
+    const pager_benchmark = b.addTest(.{
+        .name = "pager-benchmark",
+        .root_source_file = .{ .cwd_relative = "tests/pager_benchmark_test.zig" },
         .target = target,
         .optimize = optimize,
     });
-    memory_pool_benchmark.root_module.addImport("storage", storage_module);
+    pager_benchmark.root_module.addImport("storage", storage_module);
 
     // Create run steps
     const run_page_benchmark = b.addRunArtifact(page_benchmark);
-    const run_memory_pool_benchmark = b.addRunArtifact(memory_pool_benchmark);
+    const run_pager_benchmark = b.addRunArtifact(pager_benchmark);
 
     // Add benchmark step that runs both benchmarks
     const bench_step = b.step("bench", "Run all benchmarks");
     bench_step.dependOn(&run_page_benchmark.step);
-    bench_step.dependOn(&run_memory_pool_benchmark.step);
+    bench_step.dependOn(&run_pager_benchmark.step);
 
     // Add individual benchmark steps
     const page_bench_step = b.step("page-bench", "Run page benchmarks");
     page_bench_step.dependOn(&run_page_benchmark.step);
 
-    const pool_bench_step = b.step("pool-bench", "Run memory pool benchmarks");
-    pool_bench_step.dependOn(&run_memory_pool_benchmark.step);
+    const pager_bench_step = b.step("pager-bench", "Run pager benchmarks");
+    pager_bench_step.dependOn(&run_pager_benchmark.step);
 }

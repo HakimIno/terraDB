@@ -53,4 +53,30 @@ pub fn build(b: *std.Build) void {
 
     const pager_bench_step = b.step("pager-bench", "Run pager benchmarks");
     pager_bench_step.dependOn(&run_pager_benchmark.step);
+
+    // Create a module for our parser code
+    const parser_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = "src/parser/parser.zig" },
+        .imports = &.{},
+    });
+
+    // Add parser tests
+    const parser_tests = b.addTest(.{
+        .name = "parser-tests",
+        .root_source_file = .{ .cwd_relative = "tests/parser_test.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    parser_tests.root_module.addImport("parser", parser_module);
+
+    // Create run step for parser tests
+    const run_parser_tests = b.addRunArtifact(parser_tests);
+
+    // Add test step
+    const test_step = b.step("test", "Run all tests");
+    test_step.dependOn(&run_parser_tests.step);
+
+    // Add parser-test step for running only parser tests
+    const parser_test_step = b.step("parser-test", "Run parser tests");
+    parser_test_step.dependOn(&run_parser_tests.step);
 }

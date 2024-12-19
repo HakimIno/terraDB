@@ -1,6 +1,8 @@
 const std = @import("std");
 const enums = std.enums;
 const Allocator = std.mem.Allocator;
+const lexer = @import("lexer.zig");
+pub const FastLexer = lexer.FastLexer;
 
 pub const TokenType = enum {
     // Keywords
@@ -372,6 +374,8 @@ pub const ASTNodeType = enum {
     data_type,
     constraint,
     identifier,
+    create_statement,
+    unknown_statement,
 };
 
 pub const ASTNode = struct {
@@ -454,423 +458,167 @@ pub const ParserError = error{
     UnexpectedToken,
 } || LexerError || std.mem.Allocator.Error;
 
-pub const Parser = struct {
-    lexer: *Lexer,
-    current_token: Token,
-    allocator: Allocator,
-    
-    pub fn init(lexer: *Lexer, allocator: Allocator) !Parser {
-        return Parser{
-            .lexer = lexer,
-            .current_token = try lexer.nextToken(),
-            .allocator = allocator,
+// Custom allocator optimized for parser
+const ParserAllocator = struct {
+    const BLOCK_SIZE = 4096;
+    const MAX_BLOCKS = 32;
+
+    blocks: [MAX_BLOCKS][]u8,
+    block_count: usize,
+    current_offset: usize,
+    base_allocator: Allocator,
+
+    fn init(base_allocator: Allocator) !ParserAllocator {
+        var self = ParserAllocator{
+            .blocks = undefined,
+            .block_count = 0,
+            .current_offset = BLOCK_SIZE,
+            .base_allocator = base_allocator,
         };
+        try self.addBlock();
+        return self;
     }
 
-    fn parseSelect(self: *Parser) !*ASTNode {
-        try self.expect(.keyword_select);  // ตรวจสอบว่าเริ่มต้นด้วย SELECT
-
-        const node = try ASTNode.init(self.allocator, .select_statement, "");
-        errdefer node.deinit();
-
-        // Parse columns
-        while (true) {
-            if (self.current_token.type == .star) {
-                const star = try ASTNode.init(self.allocator, .column_ref, "*");
-                try node.addChild(star);
-                try self.advance();
-            } else if (self.current_token.type == .identifier) {
-                const column = try self.parseExpression();
-                try node.addChild(column);
-            } else {
-                return error.UnexpectedToken;  // เพิ่มการตรวจสอบ token ที่ไม่ถูกต้อง
-            }
-
-            if (self.current_token.type != .comma) break;
-            try self.advance();
-        }
-
-        // ต้องมี FROM clause
-        if (self.current_token.type != .keyword_from) {
-            return error.UnexpectedToken;
-        }
-        try self.advance();
-
-        // ต้องมีชื่อตาราง
-        if (self.current_token.type != .identifier) {
-            return error.UnexpectedToken;
-        }
-        const table = try ASTNode.init(self.allocator, .table_ref, self.current_token.value);
-        try node.addChild(table);
-        try self.advance();
-
-        // Parse optional WHERE clause
-        if (self.current_token.type == .keyword_where) {
-            try self.advance();
-            const condition = try self.parseExpression();
-            try node.addChild(condition);
-        }
-
-        return node;
+    fn addBlock(self: *ParserAllocator) !void {
+        if (self.block_count >= MAX_BLOCKS) return error.OutOfMemory;
+        const block = try self.base_allocator.alloc(u8, BLOCK_SIZE);
+        self.blocks[self.block_count] = block;
+        self.block_count += 1;
+        self.current_offset = 0;
     }
 
-    fn parseExpression(self: *Parser) ParserError!*ASTNode {
-        var left = try self.parsePrimaryExpression();
-        errdefer left.deinit();
-
-        while (true) {
-            const op_type = self.current_token.type;
-            switch (op_type) {
-                .equals, .not_equals, .greater_than, .less_than, 
-                .greater_equals, .less_equals, .keyword_and, .keyword_or => {
-                    const op = self.current_token.value;
-                    try self.advance();
-                    
-                    const right = try self.parsePrimaryExpression();
-                    errdefer right.deinit();
-                    
-                    const binary = try ASTNode.init(self.allocator, .binary_expr, op);
-                    errdefer binary.deinit();
-                    
-                    try binary.addChild(left);
-                    try binary.addChild(right);
-                    left = binary;
-                },
-                else => break,
-            }
+    fn allocBlock(self: *ParserAllocator, size: usize) ![]u8 {
+        if (size > BLOCK_SIZE) return error.OutOfMemory;
+        if (self.current_offset + size > BLOCK_SIZE) {
+            try self.addBlock();
         }
-
-        return left;
-    }
-
-    fn parsePrimaryExpression(self: *Parser) ParserError!*ASTNode {
-        switch (self.current_token.type) {
-            .identifier => {
-                const node = try ASTNode.init(self.allocator, .column_ref, self.current_token.value);
-                try self.advance();
-                return node;
-            },
-            .integer_literal, .float_literal, .string_literal => {
-                const node = try ASTNode.init(self.allocator, .literal, self.current_token.value);
-                try self.advance();
-                return node;
-            },
-            .left_paren => {
-                try self.advance();
-                const expr = try self.parseExpression();
-                try self.expect(.right_paren);
-                return expr;
-            },
-            else => return error.UnexpectedToken,
-        }
-    }
-
-    fn advance(self: *Parser) !void {
-        self.current_token = try self.lexer.nextToken();
-    }
-
-    fn expect(self: *Parser, expected: TokenType) !void {
-        if (self.current_token.type != expected) {
-            return error.UnexpectedToken;
-        }
-        try self.advance();
-    }
-
-    fn parseInsert(self: *Parser) !*ASTNode {
-        try self.expect(.keyword_insert);
-
-        const node = try ASTNode.init(self.allocator, .insert_statement, "");
-        errdefer node.deinit();
-
-        try self.expect(.keyword_into);
-        
-        // Parse table name
-        if (self.current_token.type != .identifier) {
-            return error.UnexpectedToken;
-        }
-        const table = try ASTNode.init(self.allocator, .table_ref, self.current_token.value);
-        try node.addChild(table);
-        try self.advance();
-
-        // Parse column list
-        try self.expect(.left_paren);
-        while (true) {
-            if (self.current_token.type != .identifier) {
-                return error.UnexpectedToken;
-            }
-            const column = try ASTNode.init(self.allocator, .column_ref, self.current_token.value);
-            try node.addChild(column);
-            try self.advance();
-
-            if (self.current_token.type != .comma) break;
-            try self.advance();
-        }
-        try self.expect(.right_paren);
-
-        // Parse VALUES
-        try self.expect(.keyword_values);
-        try self.expect(.left_paren);
-        
-        // Parse value list
-        while (true) {
-            const value = try self.parseExpression();
-            try node.addChild(value);
-
-            if (self.current_token.type != .comma) break;
-            try self.advance();
-        }
-        try self.expect(.right_paren);
-
-        return node;
-    }
-
-    fn parseUpdate(self: *Parser) !*ASTNode {
-        try self.expect(.keyword_update);
-
-        const node = try ASTNode.init(self.allocator, .update_statement, "");
-        errdefer node.deinit();
-
-        // Parse table name
-        if (self.current_token.type != .identifier) {
-            return error.UnexpectedToken;
-        }
-        const table = try ASTNode.init(self.allocator, .table_ref, self.current_token.value);
-        try node.addChild(table);
-        try self.advance();
-
-        try self.expect(.keyword_set);
-
-        // Parse SET assignments
-        while (true) {
-            if (self.current_token.type != .identifier) {
-                return error.UnexpectedToken;
-            }
-            const column = try ASTNode.init(self.allocator, .column_ref, self.current_token.value);
-            try self.advance();
-
-            try self.expect(.equals);
-            
-            const value = try self.parseExpression();
-            const assignment = try ASTNode.init(self.allocator, .binary_expr, "=");
-            try assignment.addChild(column);
-            try assignment.addChild(value);
-            try node.addChild(assignment);
-
-            if (self.current_token.type != .comma) break;
-            try self.advance();
-        }
-
-        // Parse optional WHERE clause
-        if (self.current_token.type == .keyword_where) {
-            try self.advance();
-            const condition = try self.parseExpression();
-            try node.addChild(condition);
-        }
-
-        return node;
-    }
-
-    fn parseDelete(self: *Parser) !*ASTNode {
-        try self.expect(.keyword_delete);
-
-        const node = try ASTNode.init(self.allocator, .delete_statement, "");
-        errdefer node.deinit();
-
-        try self.expect(.keyword_from);
-
-        // Parse table name
-        if (self.current_token.type != .identifier) {
-            return error.UnexpectedToken;
-        }
-        const table = try ASTNode.init(self.allocator, .table_ref, self.current_token.value);
-        try node.addChild(table);
-        try self.advance();
-
-        // Parse optional WHERE clause
-        if (self.current_token.type == .keyword_where) {
-            try self.advance();
-            const condition = try self.parseExpression();
-            try node.addChild(condition);
-        }
-
-        return node;
-    }
-
-    fn parseCreate(self: *Parser) !*ASTNode {
-        if (self.current_token.type == .keyword_table) {
-            return self.parseCreateTable();
-        } else if (self.current_token.type == .keyword_index) {
-            return self.parseCreateIndex();
-        }
-        return error.UnexpectedToken;
-    }
-
-    fn parseCreateIndex(self: *Parser) !*ASTNode {
-        const node = try ASTNode.init(self.allocator, .create_index_statement, "");
-        errdefer node.deinit();
-
-        try self.expect(.keyword_index);
-
-        // Parse index name
-        if (self.current_token.type != .identifier) {
-            return error.UnexpectedToken;
-        }
-        const index_name = try ASTNode.init(self.allocator, .column_ref, self.current_token.value);
-        try node.addChild(index_name);
-        try self.advance();
-
-        try self.expect(.keyword_on);
-
-        // Parse table name
-        if (self.current_token.type != .identifier) {
-            return error.UnexpectedToken;
-        }
-        const table = try ASTNode.init(self.allocator, .table_ref, self.current_token.value);
-        try node.addChild(table);
-        try self.advance();
-
-        // Parse column list
-        try self.expect(.left_paren);
-        while (true) {
-            if (self.current_token.type != .identifier) {
-                return error.UnexpectedToken;
-            }
-            const column = try ASTNode.init(self.allocator, .column_ref, self.current_token.value);
-            try node.addChild(column);
-            try self.advance();
-
-            if (self.current_token.type != .comma) break;
-            try self.advance();
-        }
-        try self.expect(.right_paren);
-
-        return node;
-    }
-
-    fn parseCreateTable(self: *Parser) !*ASTNode {
-        const node = try ASTNode.init(self.allocator, .create_table_statement, "");
-        errdefer node.deinit();
-
-        // ข้าม TABLE token
-        try self.advance();
-
-        // Parse table name
-        if (self.current_token.type != .identifier) {
-            return error.UnexpectedToken;
-        }
-        const table = try ASTNode.init(self.allocator, .table_ref, self.current_token.value);
-        try node.addChild(table);
-        try self.advance();
-
-        // Parse column definitions
-        try self.expect(.left_paren);
-        
-        var first_column = true;
-        while (self.current_token.type != .right_paren) {
-            if (!first_column) {
-                try self.expect(.comma);
-            }
-            first_column = false;
-
-            // Parse column name
-            if (self.current_token.type != .identifier) {
-                return error.UnexpectedToken;
-            }
-            const column = try ASTNode.init(self.allocator, .column_def, self.current_token.value);
-            errdefer column.deinit();
-            try self.advance();
-
-            // Parse column type
-            if (!switch (self.current_token.type) {
-                .type_int, .type_text, .type_bool, .type_float => true,
-                else => false,
-            }) {
-                return error.UnexpectedToken;
-            }
-            const type_node = try ASTNode.init(self.allocator, .data_type, self.current_token.value);
-            try column.addChild(type_node);
-            try self.advance();
-
-            // Parse constraints
-            while (true) {
-                switch (self.current_token.type) {
-                    .keyword_primary => {
-                        try self.advance();
-                        try self.expect(.keyword_key);
-                        const constraint = try ASTNode.init(self.allocator, .constraint, "PRIMARY KEY");
-                        try column.addChild(constraint);
-                    },
-                    .keyword_not => {
-                        try self.advance();
-                        try self.expect(.keyword_null);
-                        const constraint = try ASTNode.init(self.allocator, .constraint, "NOT NULL");
-                        try column.addChild(constraint);
-                    },
-                    .keyword_default => {
-                        try self.advance();
-                        const value = try self.parseExpression();
-                        errdefer value.deinit();
-                        const constraint = try ASTNode.init(self.allocator, .constraint, "DEFAULT");
-                        try constraint.addChild(value);
-                        try column.addChild(constraint);
-                    },
-                    .keyword_references => {
-                        try self.advance();
-                        if (self.current_token.type != .identifier) {
-                            return error.UnexpectedToken;
-                        }
-                        const ref_table = try ASTNode.init(self.allocator, .table_ref, self.current_token.value);
-                        try self.advance();
-                        
-                        try self.expect(.left_paren);
-                        if (self.current_token.type != .identifier) {
-                            return error.UnexpectedToken;
-                        }
-                        const ref_column = try ASTNode.init(self.allocator, .column_ref, self.current_token.value);
-                        try self.advance();
-                        try self.expect(.right_paren);
-                        
-                        const constraint = try ASTNode.init(self.allocator, .constraint, "REFERENCES");
-                        try constraint.addChild(ref_table);
-                        try constraint.addChild(ref_column);
-                        try column.addChild(constraint);
-                    },
-                    .comma, .right_paren => break,
-                    else => return error.UnexpectedToken,
-                }
-            }
-
-            try node.addChild(column);
-        }
-        
-        try self.expect(.right_paren);
-        return node;
-    }
-
-    pub fn parse(self: *Parser) !*ASTNode {
-        const result = switch (self.current_token.type) {
-            .keyword_select => try self.parseSelect(),
-            .keyword_insert => try self.parseInsert(),
-            .keyword_update => try self.parseUpdate(),
-            .keyword_delete => try self.parseDelete(),
-            .keyword_create => {
-                try self.advance();  // ข้าม CREATE token
-                const node = switch (self.current_token.type) {
-                    .keyword_table => try self.parseCreateTable(),
-                    .keyword_index => try self.parseCreateIndex(),
-                    else => return error.UnexpectedToken,
-                };
-                return node;  // Return the node directly
-            },
-            else => return error.UnexpectedToken,
-        };
-
-        // ตรวจสอบว่าจบ statement ด้วย semicolon หรือ EOF
-        if (self.current_token.type != .semicolon and self.current_token.type != .eof) {
-            return error.UnexpectedToken;
-        }
-
+        const result = self.blocks[self.block_count - 1][self.current_offset..self.current_offset + size];
+        self.current_offset += size;
         return result;
+    }
+
+    fn deinit(self: *ParserAllocator) void {
+        for (self.blocks[0..self.block_count]) |block| {
+            self.base_allocator.free(block);
+        }
+    }
+
+    pub fn allocator(self: *ParserAllocator) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = allocFn,
+                .resize = resizeFn,
+                .free = freeFn,
+            },
+        };
+    }
+
+    fn allocFn(ctx: *anyopaque, len: usize, ptr_align: u8, ret_addr: usize) ?[*]u8 {
+        _ = ptr_align;
+        _ = ret_addr;
+        const self = @as(*ParserAllocator, @alignCast(@ptrCast(ctx)));
+        if (self.allocBlock(len)) |result| {
+            return result.ptr;
+        } else |_| {
+            return null;
+        }
+    }
+
+    fn resizeFn(ctx: *anyopaque, buf: []u8, buf_align: u8, new_len: usize, ret_addr: usize) bool {
+        _ = ctx;
+        _ = buf;
+        _ = buf_align;
+        _ = new_len;
+        _ = ret_addr;
+        return false;  // We don't support resizing
+    }
+
+    fn freeFn(ctx: *anyopaque, buf: []u8, buf_align: u8, ret_addr: usize) void {
+        _ = ctx;
+        _ = buf;
+        _ = buf_align;
+        _ = ret_addr;
+        // No-op - memory is freed when ParserAllocator is deinitialized
+    }
+};
+
+// Add this enum definition before FastParser
+pub const StatementType = enum {
+    select,
+    insert,
+    update,
+    delete,
+    create,
+    unknown,
+};
+
+// Optimized parser with custom allocator
+pub const FastParser = struct {
+    lexer_instance: *FastLexer,
+    current_token: Token,
+    allocator: ParserAllocator,
+    
+    pub fn init(lexer_in: *FastLexer, base_allocator: Allocator) !FastParser {
+        return FastParser{
+            .lexer_instance = lexer_in,
+            .current_token = (try lexer_in.nextToken()).toParserToken(),
+            .allocator = try ParserAllocator.init(base_allocator),
+        };
+    }
+
+    // Add deinit function
+    pub fn deinit(self: *FastParser) void {
+        self.allocator.deinit();
+    }
+
+    // เพิ่มฟังก์ชันสำหรับ parse แต่ละประเภท
+    fn parseSelect(self: *FastParser) !*ASTNode {
+        const node = try ASTNode.init(self.allocator.allocator(), .select_statement, "");
+        // TODO: Implement SELECT parsing
+        return node;
+    }
+
+    fn parseInsert(self: *FastParser) !*ASTNode {
+        const node = try ASTNode.init(self.allocator.allocator(), .insert_statement, "");
+        // TODO: Implement INSERT parsing
+        return node;
+    }
+
+    fn parseUpdate(self: *FastParser) !*ASTNode {
+        const node = try ASTNode.init(self.allocator.allocator(), .update_statement, "");
+        // TODO: Implement UPDATE parsing
+        return node;
+    }
+
+    fn parseDelete(self: *FastParser) !*ASTNode {
+        const node = try ASTNode.init(self.allocator.allocator(), .delete_statement, "");
+        // TODO: Implement DELETE parsing
+        return node;
+    }
+
+    fn parseCreate(self: *FastParser) !*ASTNode {
+        const node = try ASTNode.init(self.allocator.allocator(), .create_statement, "");
+        // TODO: Implement CREATE parsing
+        return node;
+    }
+
+    fn parseUnknown(self: *FastParser) !*ASTNode {
+        const node = try ASTNode.init(self.allocator.allocator(), .unknown_statement, "");
+        // TODO: Implement generic parsing
+        return node;
+    }
+
+    // Parse with statement type hints for better branch prediction
+    pub fn parse(self: *FastParser, hint: StatementType) !*ASTNode {
+        return switch (hint) {
+            .select => self.parseSelect(),
+            .insert => self.parseInsert(),
+            .update => self.parseUpdate(),
+            .delete => self.parseDelete(),
+            .create => self.parseCreate(),
+            .unknown => self.parseUnknown(),
+        };
     }
 };
 

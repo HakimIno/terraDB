@@ -54,10 +54,18 @@ pub fn build(b: *std.Build) void {
     const pager_bench_step = b.step("pager-bench", "Run pager benchmarks");
     pager_bench_step.dependOn(&run_pager_benchmark.step);
 
-    // Create a module for our parser code
+    // Create lexer module
+    const lexer_module = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = "src/parser/lexer.zig" },
+        .imports = &.{},
+    });
+
+    // Create parser module with lexer dependency
     const parser_module = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "src/parser/parser.zig" },
-        .imports = &.{},
+        .imports = &.{
+            .{ .name = "lexer", .module = lexer_module },
+        },
     });
 
     // Add parser tests
@@ -69,14 +77,31 @@ pub fn build(b: *std.Build) void {
     });
     parser_tests.root_module.addImport("parser", parser_module);
 
-    // Create run step for parser tests
+    // Add parser benchmark test
+    const parser_benchmark = b.addTest(.{
+        .name = "parser-benchmark",
+        .root_source_file = .{ .cwd_relative = "tests/parser_benchmark.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    parser_benchmark.root_module.addImport("parser", parser_module);
+
+    // Create run steps
     const run_parser_tests = b.addRunArtifact(parser_tests);
+    const run_parser_benchmark = b.addRunArtifact(parser_benchmark);
 
     // Add test step
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_parser_tests.step);
 
-    // Add parser-test step for running only parser tests
+    // Add parser-test step
     const parser_test_step = b.step("parser-test", "Run parser tests");
     parser_test_step.dependOn(&run_parser_tests.step);
+
+    // Add parser-bench step
+    const parser_bench_step = b.step("parser-bench", "Run parser benchmarks");
+    parser_bench_step.dependOn(&run_parser_benchmark.step);
+
+    // Add to main bench step
+    bench_step.dependOn(&run_parser_benchmark.step);
 }
